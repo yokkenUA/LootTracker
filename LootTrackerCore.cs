@@ -1,0 +1,577 @@
+namespace LootTracker
+{
+    using System;
+    using System.Collections.Generic;
+    using System.IO;
+    using System.Runtime.InteropServices;
+    using System.Text;
+    using GameHelper;
+    using GameHelper.Plugin;
+    using GameHelper.RemoteEnums;
+    using ImGuiNET;
+    using Newtonsoft.Json;
+
+    // A completed (or currently-tracked) map run.
+    public sealed class MapRun
+    {
+        public string Name = string.Empty;   // localized area name (display only)
+        public string Hash = string.Empty;    // AreaHash — the unique instance id (dedup key)
+        public int AreaLevel;
+        public TimeSpan ActiveTime;            // wall time spent inside the map (paused in hideout/town)
+        // Accumulated net inventory delta for this run: itemPath -> Δcount (across all hideout exits,
+        // re-baselined on same-map re-entry). Positive = gained. Priced into ProfitEx in step 4.
+        public Dictionary<string, long> Gained = new(StringComparer.Ordinal);
+        // Profit fields (filled in step 4 via PriceCache). Kept here now so the table layout is stable.
+        public double ProfitEx;
+        // Monster kills tallied during the run, indexed by rarity (0 Normal · 1 Magic · 2 Rare · 3 Unique).
+        public int[] Kills = new int[4];
+    }
+
+    public sealed partial class LootTrackerCore : PCore<LootTrackerSettings>
+    {
+        // ── Inventory read chain (raw, self-contained — verified live on PoE2 0.5.3 HF3, see
+        //    LootTracker_WIP.md §11). All offsets relative to the struct base:
+        //      ServerData            +0x48  PlayerServerDataPtr   (std::vector<IntPtr>; [0] = playerData)
+        //      playerData            +0x320 PlayerInventories     (std::vector<InventoryArrayStruct> stride 0x18)
+        //      InventoryArrayStruct  +0x00  InventoryId (int)     (MainInventory1 == 1)
+        //                            +0x08  InventoryPtr0         (-> InventoryStruct)
+        //      InventoryStruct       +0x150 TotalBoxes (int x, int y)
+        //                            +0x170 ItemList              (std::vector<IntPtr>; slot->invItemPtr map,
+        //                                                          length X*Y, IntPtr.Zero = empty slot,
+        //                                                          duplicates for multi-cell items)
+        //      InventoryItemStruct   +0x00  Item                 (-> item entity)
+        //      item entity           +0x08  EntityDetailsPtr
+        //      EntityDetails         +0x08  name (std::wstring)   = "Metadata/.../<Id>" path
+        private const int ServerDataPlayerVectorOffset = 0x48;
+        private const int PlayerInventoriesVectorOffset = 0x320;
+        private const int InventoryArrayStride = 0x18;
+        private const int InventoryArrayIdOffset = 0x00;
+        private const int InventoryArrayPtr0Offset = 0x08;
+        private const int InventoryTotalBoxesOffset = 0x150;
+        private const int InventoryItemListOffset = 0x170;
+        private const int InventoryItemItemOffset = 0x00;
+        private const int EntityDetailsPtrOffset = 0x08;
+        private const int EntityDetailsNameOffset = 0x08;
+        private const int MainInventory1Id = 1; // GameHelper.RemoteEnums.InventoryName.MainInventory1
+
+        // ── Stack.Count read (entity component-map walk; offsets from GameOffsets EntityOffsets/StackOffsets) ──
+        //      item entity   +0x10 ComponentListPtr        (std::vector<IntPtr>; component[i] by index)
+        //      EntityDetails +0x28 ComponentLookUpPtr       (-> ComponentLookUpStruct)
+        //      ComponentLookUpStruct +0x28 ComponentsNameAndIndex (StdBucket; Data vector holds
+        //                                                    {NamePtr@+0x00, Index@+0x08} records, stride 0x10)
+        //      Stack component +0x18 Count
+        private const int EntityComponentListOffset = 0x10;
+        private const int EntityComponentLookupOffset = 0x28;
+        private const int ComponentLookupBucketOffset = 0x28;
+        private const int ComponentNameIndexStride = 0x10;
+        private const int StackCountOffset = 0x18;
+
+        private IntPtr processHandle = IntPtr.Zero;
+        private int handlePid;
+
+        // ── Map-run state machine (dedup by AreaHash, timer paused in hideout/town) ──
+        private MapRun? current;                 // the map currently being tracked (provisional until a new map starts)
+        private DateTime? runStartUtc;           // when the running timer started; null = paused (in hideout/town)
+        private string lastProcessedZoneHash = string.Empty; // last zone we reacted to (transition edge detector)
+        private Dictionary<string, long>? baseline; // inventory snapshot taken on map entry; delta is measured against it
+        private bool baselinePending;            // set on map entry; the baseline is captured on the first readable frame
+        private readonly List<MapRun> completed = new();
+        private DateTime sessionStartUtc = DateTime.UtcNow;
+        private bool onMapArea;                  // true while the current area is a map (not hideout/town)
+
+        private readonly PriceCache priceCache = new();
+        private DateTime nextAutoRefreshCheckUtc = DateTime.MinValue;
+
+        // {BaseItemType.Id last segment → ItemVisualIdentity dds-art basename}, for the items whose
+        // metadata id diverges from their art id (essences, soul cores, runes, many currencies — see
+        // docs/poe-ninja-api.md). poe.ninja keys prices by the art id, so a read-off-memory item must
+        // be translated to its art before lookup. Built offline from the .dat files (metaArt.json,
+        // regenerated each game patch). Items not in the map already match by metaId verbatim.
+        private Dictionary<string, string> metaToArt = new(StringComparer.Ordinal);
+
+        // UI icons (64x64 PNG in icons\), name (filename w/o ext) -> ImGui texture handle.
+        private readonly Dictionary<string, IntPtr> iconHandles = new(StringComparer.OrdinalIgnoreCase);
+
+        private string SettingPathname => Path.Join(this.DllDirectory, "config", "settings.txt");
+        private string PriceCachePathname => Path.Join(this.DllDirectory, "config", "prices.json");
+        private string MetaArtPathname => Path.Join(this.DllDirectory, "metaArt.json");
+        private string IconsDir => Path.Join(this.DllDirectory, "icons");
+
+        // Resolve an item's metadata path to the art id poe.ninja prices by:
+        //   1. exact metaId in the bridge (essences, soul cores, single divergent currencies);
+        //   2. else the metaId's non-numeric stem in the bridge → that art + the trailing number,
+        //      which is the item's LEVEL for leveled families (SkillGemUncut18 → UncutSkillGem18,
+        //      matching poe.ninja's per-level key);
+        //   3. else the bare last segment (correct for most items, incl. shared-icon currency tiers
+        //      whose game id already equals art+tier-digit, e.g. CurrencyRerollRare2).
+        private string PriceKey(string path)
+        {
+            var seg = LastSegment(path);
+            if (this.metaToArt.TryGetValue(seg, out var art))
+            {
+                return art;
+            }
+
+            int s = seg.Length;
+            while (s > 0 && seg[s - 1] >= '0' && seg[s - 1] <= '9') s--;
+            if (s > 0 && s < seg.Length)
+            {
+                var stem = seg[..s];
+                if (this.metaToArt.TryGetValue(stem, out var stemArt))
+                {
+                    return stemArt + seg[s..];
+                }
+            }
+
+            return seg;
+        }
+
+        // Load the metaId→art bridge shipped beside the dll. Missing/garbled file is non-fatal:
+        // pricing then falls back to metaId == art for every item (still correct for most).
+        private void LoadMetaArtMap()
+        {
+            try
+            {
+                if (!File.Exists(this.MetaArtPathname)) return;
+                var content = File.ReadAllText(this.MetaArtPathname);
+                var map = JsonConvert.DeserializeObject<Dictionary<string, string>>(content);
+                if (map != null) this.metaToArt = new Dictionary<string, string>(map, StringComparer.Ordinal);
+            }
+            catch
+            {
+                // keep the (empty) default; bridge simply does nothing.
+            }
+        }
+
+        public override void OnEnable(bool isGameOpened)
+        {
+            if (File.Exists(this.SettingPathname))
+            {
+                var content = File.ReadAllText(this.SettingPathname);
+                this.Settings = JsonConvert.DeserializeObject<LootTrackerSettings>(content)
+                                ?? new LootTrackerSettings();
+            }
+
+            this.sessionStartUtc = DateTime.UtcNow;
+            this.LoadMetaArtMap();
+            this.LoadIcons();
+
+            var fresh = this.priceCache.TryLoadFromDisk(this.PriceCachePathname, this.Settings.CacheTtlMinutes);
+            if (!fresh)
+                this.priceCache.StartRefresh(this.Settings.League, this.PriceCachePathname);
+        }
+
+        public override void OnDisable()
+        {
+            this.ResetHandle();
+            this.UnloadIcons();
+        }
+
+        // Load the 64x64 PNG icons shipped in icons\ into the overlay (name = filename without ext).
+        // Missing folder/files are non-fatal: the strip just renders text without icons.
+        private void LoadIcons()
+        {
+            try
+            {
+                if (!Directory.Exists(this.IconsDir)) return;
+                foreach (var path in Directory.EnumerateFiles(this.IconsDir, "*.png"))
+                {
+                    try
+                    {
+                        Core.Overlay.AddOrGetImagePointer(path, false, out var handle, out _, out _);
+                        if (handle != IntPtr.Zero)
+                            this.iconHandles[Path.GetFileNameWithoutExtension(path)] = handle;
+                    }
+                    catch
+                    {
+                        // skip a single bad image
+                    }
+                }
+            }
+            catch
+            {
+                // icons are optional
+            }
+        }
+
+        private void UnloadIcons()
+        {
+            try
+            {
+                if (Directory.Exists(this.IconsDir))
+                    foreach (var path in Directory.EnumerateFiles(this.IconsDir, "*.png"))
+                        Core.Overlay.RemoveImage(path);
+            }
+            catch
+            {
+                // best-effort
+            }
+
+            this.iconHandles.Clear();
+        }
+
+        public override void SaveSettings()
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(this.SettingPathname)!);
+            this.Settings.LastSyncUtc = this.priceCache.LastSyncUtc;
+            File.WriteAllText(this.SettingPathname, JsonConvert.SerializeObject(this.Settings, Formatting.Indented));
+        }
+
+        public override void DrawSettings()
+        {
+            // Collapsed-by-default group for the HUD layout knobs (no DefaultOpen flag = starts closed).
+            if (ImGui.CollapsingHeader("Settings"))
+            {
+                ImGui.SeparatorText("Compact bar (hideout)");
+                ImGui.SliderFloat("Compact bar height (px)", ref this.Settings.CompactHeight, 70f, 200f, "%.0f");
+                ImGui.SliderInt("History size", ref this.Settings.HistorySize, 5, 200);
+                ImGui.TextDisabled("Completed-map rows kept in the session history (table + memory); oldest dropped past this.");
+
+                ImGui.Spacing();
+                ImGui.SeparatorText("Map strip");
+                ImGui.Checkbox("Anchor to right side", ref this.Settings.BarOnRight);
+                ImGui.SliderFloat("Offset from bottom (px)", ref this.Settings.BarBottomOffset, 0f, 200f, "%.0f");
+                ImGui.TextDisabled("Used only as a fallback when the experience bar can't be located.");
+                ImGui.SliderFloat("Bar opacity", ref this.Settings.BarOpacity, 0f, 1f, "%.2f");
+                ImGui.Checkbox("Show kill counts", ref this.Settings.ShowKills);
+                ImGui.TextDisabled("Per-rarity monsters slain this run (Normal · Magic · Rare · Unique).");
+            }
+
+            ImGui.Spacing();
+            if (ImGui.Button("View session history"))
+            {
+                this.LoadSessions();
+                this.showSessionHistory = true;
+            }
+
+            ImGui.SliderInt("Sessions to keep", ref this.Settings.MaxSessions, 1, 200);
+            ImGui.TextDisabled("Older sessions are deleted once this many are stored. A session is saved on \"New session\".");
+            ImGui.Spacing();
+            ImGui.Separator();
+
+            ImGui.SeparatorText("Pricing");
+            ImGui.InputText("League", ref this.Settings.League, 64);
+            ImGui.SliderInt("Refresh interval (min)", ref this.Settings.CacheTtlMinutes, 5, 60);
+
+            var status = this.priceCache.Status;
+            string statusText = status switch
+            {
+                PriceSyncStatus.Syncing => "syncing…",
+                PriceSyncStatus.Ready => this.priceCache.LastSyncUtc == DateTime.MinValue
+                    ? "ready (no data yet)"
+                    : $"updated {FormatRelative(this.priceCache.LastSyncUtc)} ago",
+                PriceSyncStatus.Error => $"error: {this.priceCache.LastError}",
+                _ => "idle",
+            };
+            ImGui.Text($"Status: {statusText}");
+            ImGui.Text($"Items cached: {this.priceCache.PriceCount}");
+            if (this.priceCache.DivineToExaltedRate > 0)
+                ImGui.Text($"1 Divine = {this.priceCache.DivineToExaltedRate:F2} Exalted");
+
+            ImGui.BeginDisabled(status == PriceSyncStatus.Syncing);
+            if (ImGui.Button("Refresh now"))
+                this.priceCache.StartRefresh(this.Settings.League, this.PriceCachePathname);
+            ImGui.EndDisabled();
+        }
+
+        public override void DrawUI()
+        {
+            // Session-history windows are independent of game state (they read from disk).
+            this.DrawSessionHistoryWindow();
+            this.DrawSessionDetailWindow();
+            this.DrawMapLootWindow();
+
+            if (Core.States.GameCurrentState != GameStateTypes.InGameState)
+            {
+                return;
+            }
+
+            this.MaybeAutoRefreshPrices();
+            this.UpdateAreaState();
+            this.ScanKills();
+
+            // HUD bars hide when the game window isn't focused (alt-tabbed). The hideout compact bar
+            // additionally hides while a large panel covers the screen (Atlas / world-travel map,
+            // inventory, passive tree) so it doesn't sit on top of the Atlas.
+            if (Core.Process.Foreground)
+            {
+                if (this.onMapArea)
+                {
+                    this.DrawMapBar();
+                }
+                else if (!Core.States.InGameStateObject.GameUi.IsAnyLargePanelOpen)
+                {
+                    this.DrawCompactBar();
+                }
+            }
+        }
+
+        // Aggregate the completed runs (the live run is excluded so the rate stays stable).
+        private void SessionTotals(out TimeSpan totalActive, out double totalEx)
+        {
+            totalActive = TimeSpan.Zero;
+            totalEx = 0;
+            foreach (var r in this.completed)
+            {
+                totalActive += r.ActiveTime;
+                totalEx += this.ValueOf(r.Gained, out _, out _);
+            }
+        }
+
+        // Wipe all session state and restart the session clock. Archives the session being ended to
+        // the on-disk history first (New session = end + save + start fresh).
+        private void ResetSession()
+        {
+            this.SaveCurrentSession();
+            this.completed.Clear();
+            this.current = null;
+            this.runStartUtc = null;
+            this.baseline = null;
+            this.baselinePending = false;
+            this.lastProcessedZoneHash = string.Empty;
+            this.sessionStartUtc = DateTime.UtcNow;
+            this.ResetKillTally();
+        }
+
+        // Re-fetch prices once the cache ages past the TTL (checked at most once a minute).
+        private void MaybeAutoRefreshPrices()
+        {
+            var now = DateTime.UtcNow;
+            if (now < this.nextAutoRefreshCheckUtc)
+            {
+                return;
+            }
+
+            this.nextAutoRefreshCheckUtc = now.AddMinutes(1);
+            if (this.priceCache.Status == PriceSyncStatus.Syncing)
+            {
+                return;
+            }
+
+            var age = now - this.priceCache.LastSyncUtc;
+            if (age > TimeSpan.FromMinutes(Math.Max(1, this.Settings.CacheTtlMinutes)))
+            {
+                this.priceCache.StartRefresh(this.Settings.League, this.PriceCachePathname);
+            }
+        }
+
+        // Frame-polled area state machine. Reacts on a zone-hash transition edge; also lazily captures
+        // a pending map-entry baseline once the inventory becomes readable (after the loading screen).
+        private void UpdateAreaState()
+        {
+            var ingame = Core.States.InGameStateObject;
+            var area = ingame.CurrentAreaInstance;
+            var details = ingame.CurrentWorldInstance.AreaDetails;
+
+            string inst = area.AreaHash;
+            // Skip transient loading frames (no hash / no area name yet).
+            if (string.IsNullOrEmpty(inst) || string.IsNullOrEmpty(details.Name))
+            {
+                return;
+            }
+
+            if (inst != this.lastProcessedZoneHash)
+            {
+                this.lastProcessedZoneHash = inst;
+                this.HandleZoneTransition(area, details, inst);
+            }
+
+            // Capture the map-entry baseline on the first frame the inventory reads cleanly (the
+            // transition fires before the inventory is populated, so we defer the snapshot).
+            if (this.baselinePending && this.TrySnapshotInventory(out var snap))
+            {
+                this.baseline = snap;
+                this.baselinePending = false;
+            }
+        }
+
+        private void HandleZoneTransition(GameHelper.RemoteObjects.States.InGameStateObjects.AreaInstance area,
+            GameHelper.RemoteObjects.FilesStructures.WorldAreaDat details, string inst)
+        {
+            bool isMap = !details.IsHideout && !details.IsTown;
+            this.onMapArea = isMap;
+            var now = DateTime.UtcNow;
+
+            if (isMap)
+            {
+                // Bank the outgoing run's time before switching away from it.
+                this.BankActiveTime(now);
+
+                if (this.current != null && this.current.Hash == inst)
+                {
+                    // Straight re-entry of the same instance we were just on — keep it active.
+                }
+                else if (this.FindRun(inst) is { } existing)
+                {
+                    // Returning to a map already in history (back from a sub-area, or from the hideout):
+                    // resume that very run by its instance hash and keep accumulating into it.
+                    this.current = existing;
+                }
+                else
+                {
+                    // A genuinely new map instance: open a run and add it to history straight away, so
+                    // the table (compact bar) shows it even before the run is "finished".
+                    this.current = new MapRun
+                    {
+                        Name = details.Name,
+                        Hash = inst,
+                        AreaLevel = area.CurrentAreaLevel,
+                        ActiveTime = TimeSpan.Zero,
+                    };
+                    this.completed.Add(this.current);
+                    this.TrimCompleted();
+                }
+
+                this.runStartUtc = now;
+
+                // (Re-)baseline once the inventory is readable, so items left in stash don't count as loss.
+                this.baseline = null;
+                this.baselinePending = true;
+
+                // Drop stale per-monster bookkeeping. Counts already booked live on current.Kills, so this
+                // only ensures corpses present on (re)entry aren't mistaken for fresh kills.
+                this.ResetKillTally();
+            }
+            else if (this.current != null)
+            {
+                // Left the map into hideout/town: pause the timer, bank elapsed time, and fold this
+                // leg's inventory delta into the run's running total. The run stays in the table.
+                this.BankActiveTime(now);
+
+                if (this.baseline != null && this.TrySnapshotInventory(out var snap))
+                {
+                    MergeInto(this.current.Gained, Diff(snap, this.baseline));
+                }
+
+                this.baselinePending = false; // not on a map now
+            }
+        }
+
+        // Bank the active run's still-running time into its total and pause the timer (idempotent:
+        // a no-op when nothing is running).
+        private void BankActiveTime(DateTime now)
+        {
+            if (this.current != null && this.runStartUtc is { } start)
+            {
+                this.current.ActiveTime += now - start;
+                this.runStartUtc = null;
+            }
+        }
+
+        // Find a tracked run by its instance hash (newest first), or null. Hashes are instance-unique,
+        // so a hit means we are literally back in that same map instance.
+        private MapRun? FindRun(string hash)
+        {
+            for (int i = this.completed.Count - 1; i >= 0; i--)
+            {
+                if (this.completed[i].Hash == hash)
+                {
+                    return this.completed[i];
+                }
+            }
+
+            return null;
+        }
+
+        // Drop the oldest runs past the history limit, but never the run that's currently active.
+        private void TrimCompleted()
+        {
+            while (this.completed.Count > this.Settings.HistorySize)
+            {
+                if (ReferenceEquals(this.completed[0], this.current))
+                {
+                    break;
+                }
+
+                this.completed.RemoveAt(0);
+            }
+        }
+
+        // Active time of the current run including the live (unbanked) segment.
+        private TimeSpan CurrentLiveTime()
+        {
+            if (this.current == null)
+            {
+                return TimeSpan.Zero;
+            }
+
+            var t = this.current.ActiveTime;
+            if (this.runStartUtc is { } start)
+            {
+                t += DateTime.UtcNow - start;
+            }
+
+            return t;
+        }
+
+        // ── Valuation (step 4) ───────────────────────────────────────────
+        // Throttled "current leg" delta (since the active baseline) so the provisional total updates
+        // while the player is still on the map without a per-frame component walk.
+        private DateTime nextLiveSnapUtc = DateTime.MinValue;
+        private Dictionary<string, long> liveLegDelta = new(StringComparer.Ordinal);
+
+        // The run's net gains shown live: folded legs (current.Gained) plus the in-progress leg
+        // (snapshot − baseline), recomputed at most ~2 Hz.
+        private Dictionary<string, long> CurrentGainedLive()
+        {
+            if (this.current == null)
+            {
+                return new Dictionary<string, long>(StringComparer.Ordinal);
+            }
+
+            // Only while actively on the map (timer running) is there an un-folded leg to add.
+            if (this.runStartUtc != null && this.baseline != null)
+            {
+                var now = DateTime.UtcNow;
+                if (now >= this.nextLiveSnapUtc)
+                {
+                    this.nextLiveSnapUtc = now.AddMilliseconds(500);
+                    if (this.TrySnapshotInventory(out var snap))
+                    {
+                        this.liveLegDelta = Diff(snap, this.baseline);
+                    }
+                }
+
+                var combined = new Dictionary<string, long>(this.current.Gained, StringComparer.Ordinal);
+                MergeInto(combined, this.liveLegDelta);
+                return combined;
+            }
+
+            return this.current.Gained;
+        }
+
+        // Exalted value of a net delta: Σ Δcount × unit price. Items poe.ninja doesn't price (rares,
+        // unmapped bases) contribute 0. priced = how many distinct keys resolved (for an "incomplete" hint).
+        private double ValueOf(Dictionary<string, long> delta, out int priced, out int unpriced)
+        {
+            priced = 0;
+            unpriced = 0;
+            double sum = 0;
+            foreach (var kv in delta)
+            {
+                if (kv.Value == 0) continue;
+                if (this.priceCache.TryGetPriceByArtId(this.PriceKey(kv.Key), out var unit) && unit > 0)
+                {
+                    sum += unit * kv.Value;
+                    priced++;
+                }
+                else
+                {
+                    unpriced++;
+                }
+            }
+
+            return sum;
+        }
+
+        private static string FormatRelative(DateTime utc)
+        {
+            var span = DateTime.UtcNow - utc;
+            if (span < TimeSpan.Zero) span = TimeSpan.Zero;
+            if (span.TotalMinutes < 1) return $"{(int)span.TotalSeconds}s";
+            if (span.TotalHours < 1) return $"{(int)span.TotalMinutes}m";
+            if (span.TotalDays < 1) return $"{(int)span.TotalHours}h";
+            return $"{(int)span.TotalDays}d";
+        }
+    }
+}
