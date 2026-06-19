@@ -24,7 +24,7 @@ namespace LootTracker
         // Pixels from the bottom of the game window to the map strip's bottom edge. Used only as a
         // fallback when the experience-bar element can't be located (otherwise the strip auto-anchors
         // just above it).
-        public float BarBottomOffset = 30f;
+        public float BarBottomOffset = 5f;
 
         // Horizontal side for the map strip: true = right (default), false = left.
         public bool BarOnRight = true;

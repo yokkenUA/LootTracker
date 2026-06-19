@@ -18,14 +18,13 @@ namespace LootTracker
         // the XP element's scaled screen rect to plugins, so we anchor to the viewport bottom edge.
         private void DrawMapBar()
         {
-            // Anchor the strip's bottom edge to the TOP of the experience bar, on the chosen side, so it
-            // sits directly above it. The element's scaled screen rect comes from GameHelper's
-            // UiElementBase (handles UI scale / cull). If it can't be resolved (patch moved the child
-            // index, or mid-transition), fall back to the viewport bottom + the manual offset slider.
+            // Anchor the strip's bottom edge to the experience-bar element (its real scaled screen rect,
+            // so it tracks resolution / UI scale), on the chosen side, then lift it by BarBottomOffset so
+            // it clears the bar. Falls back to the viewport bottom if the element can't be resolved.
             float anchorX, anchorY;
             if (TryGetExperienceBarRect(out var xpPos, out var xpSize))
             {
-                anchorY = xpPos.Y;
+                anchorY = xpPos.Y - this.Settings.BarBottomOffset;
                 anchorX = this.Settings.BarOnRight ? xpPos.X + xpSize.X : xpPos.X;
             }
             else
@@ -116,8 +115,10 @@ namespace LootTracker
 
         // ── Compact hideout bar ──────────────────────────────────────────
         // A wide session readout pinned into the empty band above the bottom HUD; the sole hideout/town
-        // UI. Anchored to the experience-bar element so it lands in that gap; falls back to a centred
-        // viewport position. Unlike the map strip this one is interactive — it carries New session.
+        // UI. Its bottom edge sits at the same viewport line as the map strip (BarBottomOffset up from
+        // the window bottom) so it clears the HUD; its width tracks the experience-bar element when the
+        // running core exposes it, otherwise it falls back to a centred viewport width. Unlike the map
+        // strip this one is interactive — it carries New session.
         private void DrawCompactBar()
         {
             float h = Math.Clamp(this.Settings.CompactHeight, 60f, 400f);
@@ -125,7 +126,7 @@ namespace LootTracker
             if (TryGetExperienceBarRect(out var xpPos, out var xpSize))
             {
                 x = xpPos.X;
-                y = xpPos.Y;            // the panel's bottom edge sits on the top of the XP bar
+                y = xpPos.Y - this.Settings.BarBottomOffset; // bottom edge lifted off the XP bar
                 w = xpSize.X;
             }
             else
@@ -253,6 +254,8 @@ namespace LootTracker
         private static bool gameUiReflectionReady;
         private static PropertyInfo? expBarProp;
         private static PropertyInfo? largePanelProp;
+        private static PropertyInfo? atlasProp;
+        private static PropertyInfo? worldMapProp;
 
         private static void EnsureGameUiReflection(object gameUi)
         {
@@ -264,11 +267,17 @@ namespace LootTracker
             var t = gameUi.GetType();
             expBarProp = t.GetProperty("ExperienceBar");
             largePanelProp = t.GetProperty("IsAnyLargePanelOpen");
+            // The endgame Atlas is a separate panel from the world-travel map and isn't always folded
+            // into IsAnyLargePanelOpen by every fork, so we also probe these element members directly.
+            atlasProp = t.GetProperty("Atlas");
+            worldMapProp = t.GetProperty("WorldMapPanel");
             gameUiReflectionReady = true;
         }
 
-        // True only when the (fork) core reports a large panel open (Atlas / inventory / passive tree).
-        // On a stock core the member is absent, so this returns false and the compact bar stays up.
+        // True when a large blocking panel covers the screen (inventory / passive tree / world map /
+        // endgame Atlas). We OR the core's own IsAnyLargePanelOpen (when present) with a direct check of
+        // the Atlas / WorldMapPanel elements, because not every fork folds the endgame Atlas into that
+        // flag. Members absent on the running core are simply skipped (compact bar just stays up).
         private static bool IsLargePanelOpen()
         {
             var gameUi = Core.States.InGameStateObject?.GameUi;
@@ -278,13 +287,37 @@ namespace LootTracker
             }
 
             EnsureGameUiReflection(gameUi);
-            return largePanelProp?.GetValue(gameUi) is bool open && open;
+            if (largePanelProp?.GetValue(gameUi) is bool open && open)
+            {
+                return true;
+            }
+
+            return IsElementVisible(atlasProp, gameUi) || IsElementVisible(worldMapProp, gameUi);
         }
 
-        // Scaled screen rect of the experience bar (fork core: GameUi -> 95 -> 0), via UiElementBase.
-        // False when not resolvable (member absent on stock core / index moved / mid-transition / not
-        // visible) so the caller can fall back to a viewport-anchored position.
-        private static bool TryGetExperienceBarRect(out System.Numerics.Vector2 pos, out System.Numerics.Vector2 size)
+        // Reads a UiElementBase-typed GameUi property by reflection and returns its IsVisible, false if
+        // the member is absent / null / not a UiElementBase on the running core.
+        private static bool IsElementVisible(PropertyInfo? prop, object gameUi)
+        {
+            return prop?.GetValue(gameUi) is UiElementBase el && el.Address != IntPtr.Zero && el.IsVisible;
+        }
+
+        // Scaled screen rect of the experience bar. Primary path resolves it by Flags fingerprint by
+        // walking GameUi's UI tree ourselves (fork-independent — see LootTrackerCore.UiTree.cs); the
+        // reflection path is a fallback for a fork that exposes GameUi.ExperienceBar directly.
+        private bool TryGetExperienceBarRect(out System.Numerics.Vector2 pos, out System.Numerics.Vector2 size)
+        {
+            if (this.TryGetExperienceBarRectByFp(out pos, out size))
+            {
+                return true;
+            }
+
+            return TryGetExperienceBarRectByReflection(out pos, out size);
+        }
+
+        // Fallback: a fork whose ImportantUiElements exposes ExperienceBar (its UiElementBase already
+        // carries the scaled rect). Absent on most forks, in which case this returns false.
+        private static bool TryGetExperienceBarRectByReflection(out System.Numerics.Vector2 pos, out System.Numerics.Vector2 size)
         {
             pos = default;
             size = default;

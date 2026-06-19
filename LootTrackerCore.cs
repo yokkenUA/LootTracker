@@ -228,10 +228,11 @@ namespace LootTracker
                 ImGui.TextDisabled("Completed-map rows kept in the session history (table + memory); oldest dropped past this.");
 
                 ImGui.Spacing();
-                ImGui.SeparatorText("Map strip");
+                ImGui.SeparatorText("Bars (map strip + compact)");
                 ImGui.Checkbox("Anchor to right side", ref this.Settings.BarOnRight);
-                ImGui.SliderFloat("Offset from bottom (px)", ref this.Settings.BarBottomOffset, 0f, 200f, "%.0f");
-                ImGui.TextDisabled("Used only as a fallback when the experience bar can't be located.");
+                ImGui.SliderFloat("Offset from bottom (px)", ref this.Settings.BarBottomOffset, 0f, 300f, "%.0f");
+                ImGui.TextDisabled("Distance the bars sit up from the bottom of the game window. Raise it until\n" +
+                    "they clear the experience bar / skill bar at your resolution and UI scale.");
                 ImGui.SliderFloat("Bar opacity", ref this.Settings.BarOpacity, 0f, 1f, "%.2f");
                 ImGui.Checkbox("Show kill counts", ref this.Settings.ShowKills);
                 ImGui.TextDisabled("Per-rarity monsters slain this run (Normal · Magic · Rare · Unique).");
@@ -290,10 +291,12 @@ namespace LootTracker
             this.UpdateAreaState();
             this.ScanKills();
 
-            // HUD bars hide when the game window isn't focused (alt-tabbed). The hideout compact bar
-            // additionally hides while a large panel covers the screen (Atlas / world-travel map,
-            // inventory, passive tree) so it doesn't sit on top of the Atlas.
-            if (Core.Process.Foreground)
+            // HUD bars hide when the game window isn't focused (alt-tabbed), and whenever the experience
+            // bar can't be resolved. The game hides the experience bar whenever a large panel covers the
+            // screen (Atlas / world-travel map, inventory, passive tree), so a failed FP resolve is
+            // itself a reliable, fork-independent "panel is open" signal — both bars hide in that case
+            // instead of falling back to a viewport position that would overlap the open panel.
+            if (Core.Process.Foreground && this.TryGetExperienceBarRect(out _, out _))
             {
                 if (this.onMapArea)
                 {
