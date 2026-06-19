@@ -2,9 +2,11 @@ namespace LootTracker
 {
     using System;
     using System.Collections.Generic;
+    using System.Reflection;
     using System.Runtime.InteropServices;
     using System.Text;
     using GameHelper;
+    using GameHelper.RemoteObjects.UiElement;
     using ImGuiNET;
 
     public sealed partial class LootTrackerCore
@@ -241,15 +243,60 @@ namespace LootTracker
             return true;
         }
 
-        // Scaled screen rect of the experience bar (GameUi -> 95 -> 0), via GameHelper's UiElementBase.
-        // False when not resolvable (index moved / mid-transition / not visible) so the caller can
-        // fall back to a viewport-anchored position.
+        // ── Soft binding to fork-only core members ───────────────────────
+        // LootTracker may be loaded against a stock GameHelper whose ImportantUiElements lacks the
+        // fork's additions (ExperienceBar, IsAnyLargePanelOpen). Binding to them by name via reflection
+        // — rather than a direct member access — means a missing member degrades gracefully (the bar
+        // anchors to the viewport instead of the XP bar; it no longer auto-hides on the Atlas) instead
+        // of throwing MissingMethodException when the overlay method is JIT-compiled, which would blank
+        // the whole plugin. The PropertyInfos are resolved once and cached.
+        private static bool gameUiReflectionReady;
+        private static PropertyInfo? expBarProp;
+        private static PropertyInfo? largePanelProp;
+
+        private static void EnsureGameUiReflection(object gameUi)
+        {
+            if (gameUiReflectionReady)
+            {
+                return;
+            }
+
+            var t = gameUi.GetType();
+            expBarProp = t.GetProperty("ExperienceBar");
+            largePanelProp = t.GetProperty("IsAnyLargePanelOpen");
+            gameUiReflectionReady = true;
+        }
+
+        // True only when the (fork) core reports a large panel open (Atlas / inventory / passive tree).
+        // On a stock core the member is absent, so this returns false and the compact bar stays up.
+        private static bool IsLargePanelOpen()
+        {
+            var gameUi = Core.States.InGameStateObject?.GameUi;
+            if (gameUi == null)
+            {
+                return false;
+            }
+
+            EnsureGameUiReflection(gameUi);
+            return largePanelProp?.GetValue(gameUi) is bool open && open;
+        }
+
+        // Scaled screen rect of the experience bar (fork core: GameUi -> 95 -> 0), via UiElementBase.
+        // False when not resolvable (member absent on stock core / index moved / mid-transition / not
+        // visible) so the caller can fall back to a viewport-anchored position.
         private static bool TryGetExperienceBarRect(out System.Numerics.Vector2 pos, out System.Numerics.Vector2 size)
         {
             pos = default;
             size = default;
-            var xp = Core.States.InGameStateObject?.GameUi?.ExperienceBar;
-            if (xp == null || xp.Address == IntPtr.Zero || !xp.IsVisible)
+            var gameUi = Core.States.InGameStateObject?.GameUi;
+            if (gameUi == null)
+            {
+                return false;
+            }
+
+            EnsureGameUiReflection(gameUi);
+            if (expBarProp?.GetValue(gameUi) is not UiElementBase xp ||
+                xp.Address == IntPtr.Zero || !xp.IsVisible)
             {
                 return false;
             }

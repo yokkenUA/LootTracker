@@ -299,7 +299,7 @@ namespace LootTracker
                 {
                     this.DrawMapBar();
                 }
-                else if (!Core.States.InGameStateObject.GameUi.IsAnyLargePanelOpen)
+                else if (!IsLargePanelOpen())
                 {
                     this.DrawCompactBar();
                 }

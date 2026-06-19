@@ -38,6 +38,12 @@ the middle of the screen.
   standalone app).
 - .NET 10 SDK (the project targets `net10.0-windows`, x64).
 
+> **Core compatibility.** Two niceties — anchoring the bars exactly above the experience bar, and
+> auto-hiding the compact bar while the Atlas / a large panel is open — use `ExperienceBar` and
+> `IsAnyLargePanelOpen` on `ImportantUiElements`. These are resolved by reflection, so on a core that
+> lacks them the plugin still runs: the bars fall back to a viewport-anchored position and the compact
+> bar simply doesn't auto-hide. No hard dependency.
+
 ## Build & install
 
 This plugin is meant to live inside a GH source tree, because it references `GameHelper.csproj` and
