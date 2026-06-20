@@ -327,12 +327,12 @@ namespace LootTracker
                                 var primary = ln["primaryValue"]?.Value<double?>() ?? 0;
                                 if (string.IsNullOrEmpty(name) || primary <= 0 || rate <= 0) continue;
                                 var price = primary * rate;
+                                // "Normal" / "Magic" / "Rare" for tablets; a roll-variant name for uniques.
+                                var variant = ln["variant"]?.Value<string>();
 
-                                // One tablet/unique art spans many listed roll-variants (and the game
-                                // collapses them all to one base type, e.g. every Abyss tablet reads as
-                                // "AbyssAugment"). Keep the MAX so the shown value is stable (independent
-                                // of API order) and reflects the type's achievable ceiling rather than a
-                                // random low-roll outlier.
+                                // Name/art MAX across every variant — the stable fallback used for
+                                // uniques (whose icon is already item-specific) and when the read item's
+                                // exact rarity isn't listed.
                                 var nk = Normalize(name!);
                                 if (nk.Length > 0 && (!aggregated.TryGetValue(nk, out var pn) || price > pn))
                                     aggregated[nk] = price;
@@ -345,6 +345,21 @@ namespace LootTracker
                                     {
                                         aggregatedArt[ak] = price;
                                         aggregatedArtNames[ak] = name!;
+                                    }
+
+                                    // Per-rarity key. Tablets list Normal/Magic/Rare under ONE shared
+                                    // icon at very different prices, so a bare-art MAX would value a
+                                    // white tablet as the rare-rolled ceiling. Keying by art+variant
+                                    // keeps each rarity separate; the overlay matches it with the rarity
+                                    // it reads off the item. (MAX still collapses same-rarity roll-variants.)
+                                    if (!string.IsNullOrEmpty(variant))
+                                    {
+                                        var vk = Normalize(art + variant);
+                                        if (vk.Length > 0 && (!aggregatedArt.TryGetValue(vk, out var pv) || price > pv))
+                                        {
+                                            aggregatedArt[vk] = price;
+                                            aggregatedArtNames[vk] = name!;
+                                        }
                                     }
                                 }
                             }

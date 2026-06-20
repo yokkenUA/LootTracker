@@ -2,6 +2,7 @@ namespace LootTracker
 {
     using System;
     using System.Numerics;
+    using System.Reflection;
     using System.Runtime.InteropServices;
     using GameHelper;
     using ImGuiNET;
@@ -178,13 +179,38 @@ namespace LootTracker
             return size.X > 50f && size.Y > 2f;
         }
 
+        // ── Letterbox cull (black bars) ───────────────────────────────────────────────────────────
+        // The game adds a horizontal cull (black bar) on each side when the window is wider than the
+        // UI's max aspect — i.e. on ultrawide displays. Core.GameWindowScale folds it into the width
+        // scale and UiElementBase.Position adds it to X; both are needed to land the bars on the XP bar
+        // on letterboxed displays. Core.GameCull is internal (no InternalsVisibleTo for plugins), so we
+        // read its public Value by reflection once and cache it. A core that hides it degrades to
+        // cull = 0 — exactly the previous behaviour, which is already correct on non-letterboxed screens.
+        private static bool cullReflectionReady;
+        private static PropertyInfo? cullValueProp;
+        private static object? cullInstance;
+
+        private static int GameCull()
+        {
+            if (!cullReflectionReady)
+            {
+                cullReflectionReady = true;
+                var p = typeof(Core).GetProperty("GameCull", BindingFlags.NonPublic | BindingFlags.Static);
+                cullInstance = p?.GetValue(null);
+                cullValueProp = cullInstance?.GetType().GetProperty("Value");
+            }
+
+            return cullValueProp?.GetValue(cullInstance) is int v ? v : 0;
+        }
+
         // ── Geometry (mirrors GameHelper.UiElementBase.Position / Size) ───────────────────────────
-        // The letterbox cull term (added to X on letterboxed displays) is omitted, matching the other
-        // plugins' resolvers — it's 0 on standard full-window displays.
+        // Width scale uses the culled width (DisplaySize.X − 2·cull); the screen X (TryScreenPosition)
+        // adds the cull back — exactly as Core.GameWindowScale / UiElementBase.Position do, so the bars
+        // track the XP bar on letterboxed (ultrawide) displays, not just standard full-window ones.
         private static (float W, float H) UiScaleValue(byte index, float multiplier)
         {
             var io = ImGui.GetIO();
-            float v1 = io.DisplaySize.X / 2560f;
+            float v1 = (io.DisplaySize.X - (2f * GameCull())) / 2560f;
             float v2 = io.DisplaySize.Y / 1600f;
             float w = multiplier, h = multiplier;
             switch (index)
@@ -212,7 +238,7 @@ namespace LootTracker
             }
 
             var (w, h) = UiScaleValue(el.ScaleIndex, el.LocalScaleMultiplier);
-            screen = new Vector2(p.X * w, p.Y * h);
+            screen = new Vector2((p.X * w) + GameCull(), p.Y * h);
             return true;
         }
 

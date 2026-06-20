@@ -66,6 +66,20 @@ namespace LootTracker
         private const int ComponentNameIndexStride = 0x10;
         private const int StackCountOffset = 0x18;
 
+        // Mods component → item rarity (0 Normal · 1 Magic · 2 Rare · 3 Unique). Inventory items carry
+        // the "Mods" component (its ModsAndObjectMagicProperties block sits at +0x00, so Rarity is at
+        // +0x94); the "ObjectMagicProperties" component — block at +0xB0 — is the monster-side variant.
+        // Verified live on PoE2 (Runes of Aldur): Normal/Magic/Rare/Unique tablets + Rare waystones.
+        private const int ModsRarityOffset = 0x94;
+
+        // RenderItem component → the item's 2D-art .dds path as a std::wstring (buffer ptr @ +0x28,
+        // length @ +0x38) e.g. "Art/2DItems/Currency/PrecursorTablets/PrecursorTabletDeliriumUnique1.dds".
+        // The basename is the ItemVisualIdentity art id poe.ninja keys by — and it is UNIQUE-SPECIFIC,
+        // so it's the only reliable way to tell apart uniques that share one base metapath (every unique
+        // tablet reads as TowerAugment/<Type>Augment). Verified live: a unique Delirium tablet rendered
+        // "PrecursorTabletDeliriumUnique1" (= poe.ninja "Clear Skies"); a normal one "PrecursorTabletGeneric".
+        private const int RenderItemArtOffset = 0x28;
+
         private IntPtr processHandle = IntPtr.Zero;
         private int handlePid;
 
@@ -124,6 +138,75 @@ namespace LootTracker
             }
 
             return seg;
+        }
+
+        // Inventory-aggregation keys are "<rarity-digit><metadata-path>" (see BuildItemKey), so
+        // same-base different-rarity items stay distinct. Splits one back into its parts; a key without
+        // the separator (legacy save) is treated as Normal.
+        private const char ItemKeySep = '';
+
+        private static (int rarity, string path, string renderArt) SplitItemKey(string key)
+        {
+            int sep = key.IndexOf(ItemKeySep);
+            if (sep < 0) return (0, key, string.Empty);
+            int r = (sep == 1 && key[0] >= '0' && key[0] <= '3') ? key[0] - '0' : 0;
+            var rest = key[(sep + 1)..];
+            int sep2 = rest.IndexOf(ItemKeySep);
+            if (sep2 < 0) return (r, rest, string.Empty);
+            return (r, rest[..sep2], rest[(sep2 + 1)..]);
+        }
+
+        // Composite key: a single rarity digit + the metadata path. Lets the snapshot/delta dictionaries
+        // distinguish a Normal Abyss tablet from a Rare one (poe.ninja prices them very differently under
+        // one shared icon). Stackable currency is always Normal → "0<path>".
+        private static string BuildItemKey(int rarity, string path, string renderArt) =>
+            string.IsNullOrEmpty(renderArt)
+                ? $"{(char)('0' + (rarity & 3))}{ItemKeySep}{path}"
+                : $"{(char)('0' + (rarity & 3))}{ItemKeySep}{path}{ItemKeySep}{renderArt}";
+
+        // poe.ninja's tablet "variant" label for an in-game rarity index.
+        private static string RarityVariant(int rarity) => rarity switch
+        {
+            1 => "Magic",
+            2 => "Rare",
+            3 => "Unique",
+            _ => "Normal",
+        };
+
+        // Resolve one inventory key to its unit Exalted price and display label. Tries the per-rarity
+        // art key first (tablets: Normal/Magic/Rare share an icon but list distinct prices), then the
+        // bare art id (currency, and uniques whose icon already encodes the item). Label prefers the
+        // variant's poe.ninja name, then the bare art's, then the art id itself.
+        private bool TryPriceItem(string itemKey, out double unit, out string label)
+        {
+            var (rarity, path, renderArt) = SplitItemKey(itemKey);
+
+            // Uniques: the base metapath is shared by every unique on that base (all unique tablets read
+            // as TowerAugment/<Type>Augment), so the only reliable identity is the rendered icon art id —
+            // which is exactly what poe.ninja keys uniques by. Match on it and DON'T fall back to the bare
+            // base art (that's the base/Normal price and would badly misvalue the unique); an unlisted
+            // unique stays unpriced instead.
+            if (rarity == 3 && renderArt.Length > 0)
+            {
+                bool up = this.priceCache.TryGetPriceByArtId(renderArt, out unit) && unit > 0;
+                label = this.priceCache.TryGetNameByArtId(renderArt, out var unm) && unm.Length > 0 ? unm : renderArt;
+                if (!up) unit = 0;
+                return up;
+            }
+
+            var art = this.PriceKey(path);
+            var variantKey = art + RarityVariant(rarity);
+
+            bool priced;
+            if (this.priceCache.TryGetPriceByArtId(variantKey, out unit) && unit > 0) priced = true;
+            else if (this.priceCache.TryGetPriceByArtId(art, out unit) && unit > 0) priced = true;
+            else { unit = 0; priced = false; }
+
+            if (this.priceCache.TryGetNameByArtId(variantKey, out var nm) && nm.Length > 0) label = nm;
+            else if (this.priceCache.TryGetNameByArtId(art, out nm) && nm.Length > 0) label = nm;
+            else label = art;
+
+            return priced;
         }
 
         // Load the metaId→art bridge shipped beside the dll. Missing/garbled file is non-fatal:
@@ -234,11 +317,20 @@ namespace LootTracker
                 ImGui.TextDisabled("Distance the bars sit up from the bottom of the game window. Raise it until\n" +
                     "they clear the experience bar / skill bar at your resolution and UI scale.");
                 ImGui.SliderFloat("Bar opacity", ref this.Settings.BarOpacity, 0f, 1f, "%.2f");
+                ImGui.SliderFloat("UI scale", ref this.Settings.UiScale, 0.5f, 2f, "%.2f");
+                ImGui.TextDisabled("Manual multiplier on top of the automatic game-UI scale (window height / 1600).\n" +
+                    "Font and fixed widths scale with it, so the bars match the HUD across resolutions.");
                 ImGui.Checkbox("Show kill counts", ref this.Settings.ShowKills);
                 ImGui.TextDisabled("Per-rarity monsters slain this run (Normal · Magic · Rare · Unique).");
             }
 
             ImGui.Spacing();
+            if (ImGui.Button("New session"))
+            {
+                this.ResetSession();
+            }
+
+            ImGui.SameLine(0f, 20f);
             if (ImGui.Button("View session history"))
             {
                 this.LoadSessions();
@@ -553,7 +645,7 @@ namespace LootTracker
             foreach (var kv in delta)
             {
                 if (kv.Value == 0) continue;
-                if (this.priceCache.TryGetPriceByArtId(this.PriceKey(kv.Key), out var unit) && unit > 0)
+                if (this.TryPriceItem(kv.Key, out var unit, out _))
                 {
                     sum += unit * kv.Value;
                     priced++;

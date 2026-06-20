@@ -11,6 +11,15 @@ namespace LootTracker
 
     public sealed partial class LootTrackerCore
     {
+        // Game-UI scale factor applied to the bars' font and fixed metrics: the auto factor
+        // (DisplaySize.Y / 1600 — the game's own UI height-scale base) times the manual UiScale knob,
+        // so the overlay shrinks/grows with the HUD across resolutions instead of clipping its content.
+        private float UiScaleFactor()
+        {
+            float auto = ImGui.GetIO().DisplaySize.Y / 1600f;
+            return Math.Clamp(auto * this.Settings.UiScale, 0.5f, 3f);
+        }
+
         // ── Map strip ────────────────────────────────────────────────────
         // A slim, click-through line pinned to the bottom of the game window (right side by default),
         // shown while on a map so it doesn't block the run: "<map> · <timer> · <+X ex>". Sits just
@@ -46,6 +55,8 @@ namespace LootTracker
                 ImGui.End();
                 return;
             }
+
+            ImGui.SetWindowFontScale(this.UiScaleFactor());
 
             var gained = this.CurrentGainedLive();
             double ex = this.ValueOf(gained, out _, out _);
@@ -114,30 +125,37 @@ namespace LootTracker
         }
 
         // ── Compact hideout bar ──────────────────────────────────────────
-        // A wide session readout pinned into the empty band above the bottom HUD; the sole hideout/town
-        // UI. Its bottom edge sits at the same viewport line as the map strip (BarBottomOffset up from
-        // the window bottom) so it clears the HUD; its width tracks the experience-bar element when the
-        // running core exposes it, otherwise it falls back to a centred viewport width. Unlike the map
-        // strip this one is interactive — it carries New session.
+        // A session readout pinned into the empty band above the bottom HUD; the sole hideout/town UI.
+        // Its bottom edge sits at the same viewport line as the map strip (BarBottomOffset up from the
+        // window bottom) so it clears the HUD. Its width tracks the experience-bar element but is capped
+        // (CompactMaxWidth) so it doesn't span an ultrawide screen; once capped it's pinned to the chosen
+        // side of the XP bar via the same BarOnRight knob as the map strip. A pure read-out (the
+        // New-session button lives in the plugin settings now).
+        private const float CompactMaxWidth = 730f;
+
         private void DrawCompactBar()
         {
             float h = Math.Clamp(this.Settings.CompactHeight, 60f, 400f);
-            float x, y, w;
+            float x, y, w, pivotX;
             if (TryGetExperienceBarRect(out var xpPos, out var xpSize))
             {
-                x = xpPos.X;
+                w = Math.Min(xpSize.X, CompactMaxWidth);
                 y = xpPos.Y - this.Settings.BarBottomOffset; // bottom edge lifted off the XP bar
-                w = xpSize.X;
+                // Capped narrower than the XP bar — pin it to the chosen side of the bar.
+                x = this.Settings.BarOnRight ? xpPos.X + xpSize.X : xpPos.X;
+                pivotX = this.Settings.BarOnRight ? 1f : 0f;
             }
             else
             {
                 var vp = ImGui.GetMainViewport();
-                w = Math.Min(1100f, vp.Size.X - 220f);
-                x = vp.Pos.X + ((vp.Size.X - w) * 0.5f);
+                const float margin = 8f;
+                w = Math.Min(vp.Size.X - 220f, CompactMaxWidth);
+                x = this.Settings.BarOnRight ? vp.Pos.X + vp.Size.X - margin : vp.Pos.X + margin;
                 y = vp.Pos.Y + vp.Size.Y - this.Settings.BarBottomOffset;
+                pivotX = this.Settings.BarOnRight ? 1f : 0f;
             }
 
-            ImGui.SetNextWindowPos(new System.Numerics.Vector2(x, y), ImGuiCond.Always, new System.Numerics.Vector2(0f, 1f));
+            ImGui.SetNextWindowPos(new System.Numerics.Vector2(x, y), ImGuiCond.Always, new System.Numerics.Vector2(pivotX, 1f));
             ImGui.SetNextWindowSize(new System.Numerics.Vector2(w, h), ImGuiCond.Always);
             ImGui.SetNextWindowBgAlpha(Math.Clamp(this.Settings.BarOpacity, 0f, 1f));
             const ImGuiWindowFlags flags = ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoNav |
@@ -149,26 +167,19 @@ namespace LootTracker
                 return;
             }
 
+            float s = this.UiScaleFactor();
+            ImGui.SetWindowFontScale(s);
+
             this.SessionTotals(out var totalActive, out var totalEx);
             int maps = this.completed.Count;
             double perHour = totalActive.TotalHours > 0 ? totalEx / totalActive.TotalHours : 0;
             TimeSpan avgTime = maps > 0 ? totalActive / maps : TimeSpan.Zero;
             double avgProfit = maps > 0 ? totalEx / maps : 0;
             var rate = this.priceCache.DivineToExaltedRate;
-            const float colGap = 28f;
+            float colGap = 28f * s;
 
-            // Column 1 — session controls + clocks.
-            ImGui.BeginGroup();
-            if (ImGui.Button("New session"))
-            {
-                this.ResetSession();
-            }
-
-            ImGui.Text($"Session: {FormatDuration(DateTime.UtcNow - this.sessionStartUtc)}");
-            ImGui.EndGroup();
-
-            // Column 2 — per-map aggregates (with icons).
-            ImGui.SameLine(0f, colGap);
+            // Column 1 — per-map aggregates (with icons). The New-session button now lives in the
+            // plugin settings, so the bar is a pure read-out and the left band is freed for the table.
             ImGui.BeginGroup();
             if (this.DrawInlineIcon("Map")) ImGui.SameLine(0f, 5f);
             ImGui.Text($"Maps: {maps}");
@@ -178,7 +189,7 @@ namespace LootTracker
             ImGui.Text($"AVG Profit: {avgProfit:0} Ex");
             ImGui.EndGroup();
 
-            // Column 3 — totals in Divine only (kept narrow so the table gets the width).
+            // Column 2 — totals in Divine + the session clock (kept narrow so the table gets the width).
             ImGui.SameLine(0f, colGap);
             ImGui.BeginGroup();
             var totalCol = totalEx >= 0 ? GreenCol : RedCol;
@@ -195,18 +206,22 @@ namespace LootTracker
             // [div] <n> / hour
             if (this.DrawInlineIcon("Divine")) ImGui.SameLine(0f, 4f);
             ImGui.TextColored(hourCol, $"{hourDiv} / hour");
+
+            // Session: <timer> (moved here from the old controls column so each band is 3 rows).
+            if (this.DrawInlineIcon("Time")) ImGui.SameLine(0f, 5f);
+            ImGui.Text($"Session: {FormatDuration(DateTime.UtcNow - this.sessionStartUtc)}");
             ImGui.EndGroup();
 
-            // Column 4 — completed-map table (newest first), filling the remaining width/height.
+            // Column 3 — completed-map table (newest first), filling the remaining width/height.
             ImGui.SameLine(0f, colGap);
             ImGui.BeginGroup();
             if (ImGui.BeginTable("compact_runs", 3,
                     ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY,
-                    new System.Numerics.Vector2(0f, h - 24f)))
+                    new System.Numerics.Vector2(0f, h - (24f * s))))
             {
                 ImGui.TableSetupColumn("Map");
-                ImGui.TableSetupColumn("Time", ImGuiTableColumnFlags.WidthFixed, 60);
-                ImGui.TableSetupColumn("Profit", ImGuiTableColumnFlags.WidthFixed, 90);
+                ImGui.TableSetupColumn("Time", ImGuiTableColumnFlags.WidthFixed, 60f * s);
+                ImGui.TableSetupColumn("Profit", ImGuiTableColumnFlags.WidthFixed, 90f * s);
                 ImGui.TableHeadersRow();
                 for (int i = this.completed.Count - 1; i >= 0; i--)
                 {
@@ -500,29 +515,34 @@ namespace LootTracker
                     continue;
                 }
 
-                int stack = this.TryReadStackCount(entity, detailsPtr, out int c) && c > 0 ? c : 1;
-                items.Add((path, stack));
+                this.ReadItemFacts(entity, detailsPtr, out int stack, out int rarity, out var renderArt);
+                items.Add((BuildItemKey(rarity, path, renderArt), stack));
             }
 
             return true;
         }
 
-        // Reads the entity's "Stack" component count. Returns false if the item isn't stackable
-        // (caller treats that as count 1).
-        private bool TryReadStackCount(IntPtr entity, IntPtr detailsPtr, out int count)
+        // Reads an item's Stack.Count, Mods.Rarity and (for uniques) its rendered-icon art id in a SINGLE
+        // walk of the entity's component name→index map (cheaper than one walk per component, run for every
+        // inventory item at up to ~2 Hz). Defaults: stack 1 (non-stackable), rarity 0 (Normal — also when
+        // the item lacks the Mods component, true for stackable currency), renderArt "" (read only for
+        // uniques, where the shared base metapath can't tell one unique from another — see RenderItemArtOffset).
+        private void ReadItemFacts(IntPtr entity, IntPtr detailsPtr, out int stack, out int rarity, out string renderArt)
         {
-            count = 0;
+            stack = 1;
+            rarity = 0;
+            renderArt = string.Empty;
 
             // entity +0x10 -> vector<IntPtr> of component addresses (indexed by the name->index map).
             if (!this.TryReadStdVector(entity + EntityComponentListOffset, out var compFirst, out var compLast))
             {
-                return false;
+                return;
             }
 
             long compCount = ((long)compLast - (long)compFirst) / 8;
             if (compCount <= 0 || compCount > 256)
             {
-                return false;
+                return;
             }
 
             // EntityDetails +0x28 -> ComponentLookUpStruct; +0x28 -> ComponentsNameAndIndex (StdBucket;
@@ -530,21 +550,22 @@ namespace LootTracker
             IntPtr lookup = this.ReadPtr(detailsPtr + EntityComponentLookupOffset);
             if (lookup == IntPtr.Zero)
             {
-                return false;
+                return;
             }
 
             if (!this.TryReadStdVector(lookup + ComponentLookupBucketOffset, out var niFirst, out var niLast))
             {
-                return false;
+                return;
             }
 
             long niCount = ((long)niLast - (long)niFirst) / ComponentNameIndexStride;
             if (niCount <= 0 || niCount > 256)
             {
-                return false;
+                return;
             }
 
-            for (long i = 0; i < niCount; i++)
+            int stackIndex = -1, modsIndex = -1, renderIndex = -1;
+            for (long i = 0; i < niCount && (stackIndex < 0 || modsIndex < 0 || renderIndex < 0); i++)
             {
                 IntPtr rec = niFirst + (int)(i * ComponentNameIndexStride);
                 IntPtr namePtr = this.ReadPtr(rec);
@@ -553,28 +574,62 @@ namespace LootTracker
                     continue;
                 }
 
-                if (this.ReadCString(namePtr, 16) != "Stack")
+                var name = this.ReadCString(namePtr, 40);
+                if (stackIndex < 0 && name == "Stack")
                 {
-                    continue;
+                    stackIndex = this.ReadInt(rec + 8);
                 }
-
-                int index = this.ReadInt(rec + 8);
-                if (index < 0 || index >= compCount)
+                else if (modsIndex < 0 && name == "Mods")
                 {
-                    return false;
+                    modsIndex = this.ReadInt(rec + 8);
                 }
-
-                IntPtr compAddr = this.ReadPtr(compFirst + (int)(index * 8));
-                if (compAddr == IntPtr.Zero)
+                else if (renderIndex < 0 && name == "RenderItem")
                 {
-                    return false;
+                    renderIndex = this.ReadInt(rec + 8);
                 }
-
-                count = this.ReadInt(compAddr + StackCountOffset);
-                return true;
             }
 
-            return false;
+            if (stackIndex >= 0 && stackIndex < compCount)
+            {
+                IntPtr c = this.ReadPtr(compFirst + (int)(stackIndex * 8));
+                if (c != IntPtr.Zero)
+                {
+                    int n = this.ReadInt(c + StackCountOffset);
+                    if (n > 0) stack = n;
+                }
+            }
+
+            if (modsIndex >= 0 && modsIndex < compCount)
+            {
+                IntPtr c = this.ReadPtr(compFirst + (int)(modsIndex * 8));
+                if (c != IntPtr.Zero)
+                {
+                    int r = this.ReadInt(c + ModsRarityOffset);
+                    if (r >= 0 && r <= 3) rarity = r;
+                }
+            }
+
+            // Only uniques need the rendered icon (to tell apart uniques sharing one base metapath); skip
+            // the extra wstring read for everything else.
+            if (rarity == 3 && renderIndex >= 0 && renderIndex < compCount)
+            {
+                IntPtr c = this.ReadPtr(compFirst + (int)(renderIndex * 8));
+                if (c != IntPtr.Zero)
+                {
+                    var ddsPath = this.ReadStdWString(c + RenderItemArtOffset);
+                    renderArt = ArtIdFromDdsPath(ddsPath);
+                }
+            }
+        }
+
+        // "Art/2DItems/.../PrecursorTabletDeliriumUnique1.dds" → "PrecursorTabletDeliriumUnique1" (the
+        // language-independent art id poe.ninja keys by). Returns "" for an empty/odd path.
+        private static string ArtIdFromDdsPath(string ddsPath)
+        {
+            if (string.IsNullOrEmpty(ddsPath)) return string.Empty;
+            var seg = LastSegment(ddsPath);
+            int dot = seg.LastIndexOf('.');
+            return dot > 0 ? seg[..dot] : seg;
         }
 
         private static string FormatDuration(TimeSpan t)

@@ -104,10 +104,8 @@ namespace LootTracker
                 foreach (var kv in r.Gained)
                 {
                     if (kv.Value == 0) continue;
-                    var artKey = this.PriceKey(kv.Key);
-                    bool priced = this.priceCache.TryGetPriceByArtId(artKey, out var unit) && unit > 0;
+                    bool priced = this.TryPriceItem(kv.Key, out var unit, out var label);
                     double ex = priced ? unit * kv.Value : 0;
-                    var label = this.priceCache.TryGetNameByArtId(artKey, out var nm) && nm.Length > 0 ? nm : artKey;
                     m.Loot.Add(new SessionLootLine { Label = label, Count = kv.Value, Ex = ex, Priced = priced });
                     profit += ex;
                 }
