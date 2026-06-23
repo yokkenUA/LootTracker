@@ -127,19 +127,18 @@ namespace LootTracker
         // ── Compact hideout bar ──────────────────────────────────────────
         // A session readout pinned into the empty band above the bottom HUD; the sole hideout/town UI.
         // Its bottom edge sits at the same viewport line as the map strip (BarBottomOffset up from the
-        // window bottom) so it clears the HUD. Its width tracks the experience-bar element but is capped
-        // (CompactMaxWidth) so it doesn't span an ultrawide screen; once capped it's pinned to the chosen
-        // side of the XP bar via the same BarOnRight knob as the map strip. A pure read-out (the
-        // New-session button lives in the plugin settings now).
-        private const float CompactMaxWidth = 730f;
-
+        // window bottom) so it clears the HUD. Its width is the user-set CompactWidth but is always
+        // clamped to the experience-bar width so it can't spill past it; once narrower than the bar it's
+        // pinned to the chosen side of the XP bar via the same BarOnRight knob as the map strip. A pure
+        // read-out (the New-session button lives in the plugin settings now).
         private void DrawCompactBar()
         {
             float h = Math.Clamp(this.Settings.CompactHeight, 60f, 400f);
+            float reqW = Math.Max(this.Settings.CompactWidth, 200f);
             float x, y, w, pivotX;
             if (TryGetExperienceBarRect(out var xpPos, out var xpSize))
             {
-                w = Math.Min(xpSize.X, CompactMaxWidth);
+                w = Math.Min(xpSize.X, reqW);
                 y = xpPos.Y - this.Settings.BarBottomOffset; // bottom edge lifted off the XP bar
                 // Capped narrower than the XP bar — pin it to the chosen side of the bar.
                 x = this.Settings.BarOnRight ? xpPos.X + xpSize.X : xpPos.X;
@@ -149,7 +148,7 @@ namespace LootTracker
             {
                 var vp = ImGui.GetMainViewport();
                 const float margin = 8f;
-                w = Math.Min(vp.Size.X - 220f, CompactMaxWidth);
+                w = Math.Min(vp.Size.X - 220f, reqW);
                 x = this.Settings.BarOnRight ? vp.Pos.X + vp.Size.X - margin : vp.Pos.X + margin;
                 y = vp.Pos.Y + vp.Size.Y - this.Settings.BarBottomOffset;
                 pivotX = this.Settings.BarOnRight ? 1f : 0f;

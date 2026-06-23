@@ -307,6 +307,9 @@ namespace LootTracker
             {
                 ImGui.SeparatorText("Compact bar (hideout)");
                 ImGui.SliderFloat("Compact bar height (px)", ref this.Settings.CompactHeight, 70f, 200f, "%.0f");
+                ImGui.SliderFloat("Compact bar width (px)", ref this.Settings.CompactWidth, 200f, 1920f, "%.0f");
+                ImGui.TextDisabled("Requested width of the compact bar. Capped to the experience-bar width, so it\n" +
+                    "never extends past the XP bar regardless of this value.");
                 ImGui.SliderInt("History size", ref this.Settings.HistorySize, 5, 200);
                 ImGui.TextDisabled("Completed-map rows kept in the session history (table + memory); oldest dropped past this.");
 

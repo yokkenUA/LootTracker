@@ -38,6 +38,10 @@ namespace LootTracker
         // Height (px) of the compact hideout bar.
         public float CompactHeight = 115f;
 
+        // Requested width (px) of the compact hideout bar. The effective width is clamped to the
+        // experience-bar width so the bar never spills past it; this is the cap the user dials in.
+        public float CompactWidth = 730f;
+
         // Manual multiplier on top of the auto game-UI scale (DisplaySize.Y / 1600) applied to the
         // bars' font and fixed metrics, so the overlay shrinks/grows with the game HUD across
         // resolutions. 1.0 = pure auto scale; tune per setup if the auto factor isn't ideal.
