@@ -487,6 +487,7 @@ namespace LootTracker
             GameHelper.RemoteObjects.FilesStructures.WorldAreaDat details, string inst)
         {
             bool isMap = !details.IsHideout && !details.IsTown;
+            bool wasOnMap = this.onMapArea; // map-ness of the area we're leaving (before we overwrite it)
             this.onMapArea = isMap;
             var now = DateTime.UtcNow;
 
@@ -494,6 +495,17 @@ namespace LootTracker
             {
                 // Bank the outgoing run's time before switching away from it.
                 this.BankActiveTime(now);
+
+                // Map → map transition (a sub-area, or straight map→map): the outgoing leg's inventory
+                // delta has NOT been folded yet — only hideout/town exits fold it (the else branch below).
+                // Fold it now, against the still-current run and its live baseline, before we switch
+                // `current` away; otherwise loot picked up since entry is lost. Skipped when arriving from
+                // hideout/town (wasOnMap == false): that leg was already folded on exit and the baseline is
+                // about to be re-taken, so folding here would double-count it (and absorb stash changes).
+                if (wasOnMap && this.current != null && this.baseline != null && this.TrySnapshotInventory(out var legSnap))
+                {
+                    MergeInto(this.current.Gained, Diff(legSnap, this.baseline));
+                }
 
                 if (this.current != null && this.current.Hash == inst)
                 {
