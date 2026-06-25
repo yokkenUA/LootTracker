@@ -483,10 +483,21 @@ namespace LootTracker
             }
         }
 
+        // Extra non-combat hubs that aren't flagged IsHideout/IsTown by the game data but should be
+        // treated like the hideout for loot tracking (no run opened, the outgoing leg is folded on exit).
+        // "The Well of Souls" is a safe staging hub, not a map.
+        private static readonly HashSet<string> SafeZoneNames = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "The Well of Souls",
+        };
+
+        private static bool IsSafeZone(GameHelper.RemoteObjects.FilesStructures.WorldAreaDat details)
+            => SafeZoneNames.Contains(details.Name);
+
         private void HandleZoneTransition(GameHelper.RemoteObjects.States.InGameStateObjects.AreaInstance area,
             GameHelper.RemoteObjects.FilesStructures.WorldAreaDat details, string inst)
         {
-            bool isMap = !details.IsHideout && !details.IsTown;
+            bool isMap = !details.IsHideout && !details.IsTown && !IsSafeZone(details);
             bool wasOnMap = this.onMapArea; // map-ness of the area we're leaving (before we overwrite it)
             this.onMapArea = isMap;
             var now = DateTime.UtcNow;
